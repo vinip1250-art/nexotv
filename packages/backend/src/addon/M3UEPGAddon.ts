@@ -162,6 +162,37 @@ async function fetchJsonWithTimeout(url: string, ms: number) {
     }
 }
 
+/**
+ * Determine whether a stream URL requires notWebReady: true.
+ *
+ * Per the official Stremio SDK docs, notWebReady must be true when:
+ *   - the URL does not support HTTPS, OR
+ *   - the content is not an MP4 file (i.e. HLS, TS, MKV, etc.)
+ *
+ * MP4 files served over HTTPS can be played by all Stremio clients
+ * (mobile AND TV) with notWebReady: false.
+ *
+ * HLS (.m3u8), MPEG-TS (.ts), and MKV streams require notWebReady: true
+ * on ALL clients, but the TV internal players (ExoPlayer, libVLC, MPV)
+ * still handle them correctly when the flag is set — they just cannot
+ * go through the Stremio web proxy.
+ *
+ * IMPORTANT: notWebReady: true alone does NOT prevent TV internal players
+ * from playing streams. What broke TV playback was the manifest's stream
+ * resource not having explicit `idPrefixes`, causing Stremio TV to silently
+ * skip calling the addon's stream handler entirely (bug #1469).
+ */
+function isNotWebReady(url: string): boolean {
+    if (!url) return true;
+    // Non-HTTPS URLs are not web-ready
+    if (!url.startsWith('https://')) return true;
+    // MP4 files over HTTPS are web-ready
+    const lower = url.toLowerCase().split('?')[0];
+    if (lower.endsWith('.mp4')) return false;
+    // Everything else (HLS, TS, MKV, etc.) is not web-ready
+    return true;
+}
+
 export interface AddonConfig {
     provider?: string;
     xtreamUrl?: string;
@@ -426,13 +457,12 @@ export class M3UEPGAddon {
 
     private _getRefreshCooldownMs(): number {
         if (this._consecutiveRefreshFailures <= 0) return 0;
-        if (this._consecutiveRefreshFailures === 1) return 60_000;      // 1 min
-        if (this._consecutiveRefreshFailures === 2) return 5 * 60_000;  // 5 min
-        return 30 * 60_000;                                              // 30 min
+        if (this._consecutiveRefreshFailures === 1) return 60_000;
+        if (this._consecutiveRefreshFailures === 2) return 5 * 60_000;
+        return 30 * 60_000;
     }
 
     async refreshOnFirstCatalogRequest() {
-        // Exponential backoff: don't hammer a failing provider
         if (this._refreshFailedAt !== null) {
             const cooldown = this._getRefreshCooldownMs();
             if (Date.now() - this._refreshFailedAt < cooldown) return;
@@ -451,9 +481,6 @@ export class M3UEPGAddon {
         }
 
         this.firstCatalogRefreshPromise = (async () => {
-            // Reset ETags so the forced re-fetch is unconditional (not a 304).
-            // Without this, channels evicted from RAM + a cached ETag would cause
-            // fetchData to get a 304, save 0 channels, and wipe the valid cache.
             this.m3uEtag = null;
             this.m3uLastModified = null;
             this.iptvOrgEtag = null;
@@ -472,7 +499,7 @@ export class M3UEPGAddon {
 
         try {
             await this.firstCatalogRefreshPromise;
-            this._consecutiveRefreshFailures = 0;  // reset on success
+            this._consecutiveRefreshFailures = 0;
             this._refreshFailedAt = null;
         } catch (e) {
             this._consecutiveRefreshFailures++;
@@ -827,47 +854,6 @@ export class M3UEPGAddon {
         }
     }
 
-    /**
-     * Build behaviorHints for a stream item.
-     *
-     * FIX: The original code always set `notWebReady: true`, which breaks
-     * playback on Stremio for TV (Android TV, Fire TV, Apple TV).
-     * On TV platforms, `notWebReady: true` causes the player to either refuse
-     * the stream or fail to route it correctly. Mobile Stremio ignores this
-     * flag and plays anyway, which is why mobile worked but TV did not.
-     *
-     * Rules:
-     * - If the stream has custom headers (User-Agent / Referer), we must set
-     *   `notWebReady: true` because the web player cannot inject those headers.
-     *   We also pass `headers` (the field Stremio actually uses) alongside
-     *   `proxyHeaders` for wider compatibility.
-     * - If there are NO custom headers, set `notWebReady: false` so all
-     *   Stremio clients — including TV — can play the stream natively.
-     */
-    private buildBehaviorHints(playable: any): Record<string, any> {
-        const reqHeaders: Record<string, string> = {};
-        if (playable.userAgent && playable.userAgent.trim()) {
-            reqHeaders['User-Agent'] = playable.userAgent.trim();
-        }
-        if (playable.referrer && playable.referrer.trim()) {
-            reqHeaders['Referer'] = playable.referrer.trim();
-        }
-
-        if (Object.keys(reqHeaders).length > 0) {
-            // Custom headers present: mark as not web-ready and provide headers
-            // for both proxyHeaders (SDK convention) and headers (TV client convention)
-            return {
-                notWebReady: true,
-                proxyHeaders: { request: reqHeaders },
-                // Some TV builds of Stremio read `headers` directly on the stream object
-                // rather than going through the proxy — expose both for maximum compatibility
-            };
-        }
-
-        // No custom headers: fully playable by the native TV player
-        return { notWebReady: false };
-    }
-
     async getStreams(typeOrId: string, maybeId?: string) {
         await this.ensureDataLoaded();
         const type = maybeId ? typeOrId : undefined;
@@ -884,37 +870,52 @@ export class M3UEPGAddon {
             : externalItems;
         const streams: any[] = [];
 
-        // FIX: Build the HLS (.m3u8) variant for Xtream live channels FIRST so it
-        // appears at the top of the list. The original code used `unshift` after
-        // the main loop, which was fragile and caused the HLS stream to share the
-        // same behaviorHints object reference — a mutation hazard. Now we build it
-        // upfront and push everything in the correct order.
-        const xtreamRe = /^https?:\/\/[^/]+\/[^/]+\/[^/]+\/(\d+)$/;
-
         for (const playable of playableItems) {
-            const behaviorHints = this.buildBehaviorHints(playable);
-            const urls = playable.urls && playable.urls.length > 0 ? playable.urls : (playable.url ? [playable.url] : []);
+            const reqHeaders: Record<string, string> = {};
+            if (playable.userAgent) reqHeaders['User-Agent'] = playable.userAgent;
+            if (playable.referrer)  reqHeaders['Referer']    = playable.referrer;
 
-            // For Xtream live TV streams, prepend an HLS variant as the primary option.
-            // TV players (Android TV, Apple TV) handle HLS more reliably than bare MPEG-TS.
-            if (getItemType(playable) === 'tv' && playable.url && xtreamRe.test(playable.url)) {
-                const hlsUrl = playable.url + '.m3u8';
-                const hlsBehaviorHints = this.buildBehaviorHints(playable); // independent object
-                streams.push({
-                    url: hlsUrl,
-                    ...this.buildStreamPresentation({ ...playable, containerExtension: 'm3u8' }, 0, 1, hlsUrl),
-                    behaviorHints: hlsBehaviorHints,
-                });
-            }
+            const urls = playable.urls && playable.urls.length > 0 ? playable.urls : (playable.url ? [playable.url] : []);
 
             urls.forEach((url: string, index: number) => {
                 const streamPresentation = this.buildStreamPresentation(playable, index, urls.length, url);
+
+                // Per the Stremio SDK docs: notWebReady must be true when the URL
+                // is not HTTPS or is not an MP4 file. We compute this per-URL so
+                // that MP4 VOD streams served over HTTPS get notWebReady:false,
+                // enabling native playback on TV internal players (ExoPlayer/VLC/MPV)
+                // without going through any proxy layer.
+                // Note: proxyHeaders requires notWebReady:true per SDK spec.
+                const needsNotWebReady = isNotWebReady(url) || Object.keys(reqHeaders).length > 0;
+
+                const behaviorHints: Record<string, any> = {
+                    notWebReady: needsNotWebReady,
+                };
+                if (Object.keys(reqHeaders).length > 0) {
+                    behaviorHints.proxyHeaders = { request: reqHeaders };
+                }
+
                 streams.push({
                     url,
                     ...streamPresentation,
                     behaviorHints,
                 });
             });
+
+            // For Xtream live TV: the provider already generates .m3u8 URLs.
+            // No need to append .m3u8 again. The xtreamRe pattern below only
+            // matches bare numeric IDs (no extension), which won't occur for
+            // Xtream live channels. Keeping the block only for edge-case M3U
+            // sources that might produce extensionless Xtream-style URLs.
+            const xtreamRe = /^https?:\/\/[^/]+\/[^/]+\/[^/]+\/(\d+)$/;
+            if (getItemType(playable) === 'tv' && playable.url && xtreamRe.test(playable.url)) {
+                const hlsUrl = playable.url + '.m3u8';
+                streams.unshift({
+                    url: hlsUrl,
+                    ...this.buildStreamPresentation({ ...playable, containerExtension: 'm3u8' }, 0, 1, hlsUrl),
+                    behaviorHints: { notWebReady: true },
+                });
+            }
         }
 
         return streams;
@@ -969,9 +970,8 @@ export class M3UEPGAddon {
     }
 
     private _startUpdateTimer() {
-        if (this._updateTimer !== null) return; // already running — guard against double-start
+        if (this._updateTimer !== null) return;
         this._updateTimer = setInterval(() => {
-            // Skip if circuit is open
             if (this._timerPausedUntil !== null && Date.now() < this._timerPausedUntil) return;
 
             this.updateData().then(() => {
@@ -980,13 +980,12 @@ export class M3UEPGAddon {
             }).catch((e: any) => {
                 this._timerConsecutiveFailures++;
                 if (this._timerConsecutiveFailures >= 3) {
-                    this._timerPausedUntil = Date.now() + 30 * 60_000; // pause 30 min
+                    this._timerPausedUntil = Date.now() + 30 * 60_000;
                     this.log.warn(`[TIMER] Circuit open after ${this._timerConsecutiveFailures} failures, pausing 30 min`);
                 }
                 this.log.error('[TIMER] Background update failed:', e.message);
             });
         }, env.UPDATE_INTERVAL_MS);
-        // unref: don't prevent Node.js process exit if this is the only active handle
         if (typeof (this._updateTimer as any).unref === 'function') {
             (this._updateTimer as any).unref();
         }
@@ -994,8 +993,8 @@ export class M3UEPGAddon {
 
     _evictFromMemory() {
         clearTimeout(this._evictTimer);
-        clearInterval(this._updateTimer);   // kill update timer
-        this._updateTimer = null;           // allow GC and re-start check
+        clearInterval(this._updateTimer);
+        this._updateTimer = null;
         this._evictTimer = null;
         this.channels = [];
         this.channelMap = new Map();
@@ -1016,7 +1015,7 @@ export class M3UEPGAddon {
         this._loadPromise = this.loadChannelsFromCache().finally(() => { this._loadPromise = null; });
         await this._loadPromise;
         this._resetEvictTimer();
-        this._startUpdateTimer();    // start/resume background updates
+        this._startUpdateTimer();
     }
 
     async getChannelsForCatalog(type = 'tv') {
@@ -1026,3 +1025,7 @@ export class M3UEPGAddon {
 }
 
 export { CACHE_ENABLED };
+
+
+M3UEPGAddon.ts written
+Concluído
