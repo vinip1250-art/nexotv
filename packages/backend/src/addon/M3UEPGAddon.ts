@@ -1025,7 +1025,3 @@ export class M3UEPGAddon {
 }
 
 export { CACHE_ENABLED };
-
-
-M3UEPGAddon.ts written
-Concluído
